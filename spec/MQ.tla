@@ -139,7 +139,7 @@ MoveEventFromFileToTable ≜
                     }
                 IN table[x] ∪ processed]
     ∧ file' = [q ∈ QUEUE ↦ {}]
-            ∧ UNCHANGED ⟨consumer_queue, uid, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
+    ∧ UNCHANGED ⟨consumer_queue, uid, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
 
 \* 重投已经发过的 uid。
 \*

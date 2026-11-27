@@ -47,7 +47,7 @@ flowchart LR
 | `consumer_queue[c]` | 集合的集合                       | 到了消费者手里，还没开始处理 |
 | `func_buffer[c]`    | 集合的集合                       | 正在处理                     |
 | `consumer_cache[c]` | 集合                             | 消费端去重                   |
-| `frozen`            | `[⟨queue, group⟩ ↦ uid 集合]`    | 冻结快照                     |
+| `frozen`            | `[⟨queue, group⟩ ↦ uid 集合]`    | 首次出现 end 时的 uid 快照   |
 | `uid`               | 自增整数                         | 每条事件一个                 |
 
 四个缓冲区对应三段路：中间件到网络、网络到消费者、消费者正在处理。分开是为了让每一段的乱序能单独建模。
@@ -287,11 +287,24 @@ ON CONFLICT (uid) DO NOTHING
 
 加锁是把冲突挡在门外，状态机是把冲突变成"什么都没发生"。
 
-## 冻结
+## 冻结（只能证「不分裂」，证不了「不再增长」）
 
 `Freeze` 记组第一次出现 `end` 时的 uid 集合，已经在 `frozen` 里的不覆盖。
 
-`FrozenStable` 验证：`frozen` 里记着的组，不管事件走到哪，凑出来的 uid 集合都得和快照一样。
+`FrozenStable` 验证的是：`frozen` 里记着的组，不管事件走到 `table`、`before`、`after`、`consumer_queue`、`network_buffer` 还是 `func_buffer`，凑出来的 uid 集合都得和快照一样。
+
+**这条管的是「不分裂」，不是「不再变」。**
+
+规约里 `seq` 是自增的，`end` 之后还能继续往这一组里加事件。真实现要靠 `seq <= end_seq` 挡住，加不进来，组才真正冻结。
+
+规约没有建模这个拒绝，所以：
+
+```
+能证   end 之后这个组不会被拆到两个地方
+不能证 end 之后这个组不再增长
+```
+
+第二条要等 `seq` 从参数传进来、并且加上「`end` 之后拒绝更大的 seq」这条守卫，才有意义。现在加了会让状态空间膨胀，先不写。
 
 ## 超时
 

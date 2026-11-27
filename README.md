@@ -43,33 +43,35 @@
 
 ## 架构
 
+```mermaid
+flowchart LR
+    P["Producer"] --> SM["SubmitToMiddleware"]
+    SM --> F["file[q]<br/>WAL"]
+    F -->|MoveEventFromFileToTable| T["table[q]"]
+
+    T -->|Read<br/>按组| B["before[g]"]
+    B -->|DistributeToConsumer| A["after[g]"]
+    B -->|DistributeToConsumer| NB["network_buffer[c]"]
+
+    NB -->|FromNetWorkBufferToConsumerQueue| CQ["consumer_queue[c]"]
+    CQ -->|ConsumerHandleEvent| FB["func_buffer[c]"]
+    FB -->|HandleComplete| RF["return_file[q]<br/>返回 WAL"]
+
+    A -->|UpdateTableWithProcessing| T
+    RF -->|WriteResultToTable| T
+
+    T -->|Timeout| D["状态置 Dead"]
 ```
-producer
-   |
-   v
- file[q]  --批量落库-->  table[q]
-                           |
-                        按组读取
-                           |
-                           v
-                      before[g]  (整组)
-                           |
-                        分发
-                        /     \
-                   after[g]   network_buffer
-                        |           |
-                     落库        consumer_queue
-                                    |
-                                 开始处理
-                                    |
-                                func_buffer
-                                    |
-                                 写 return_file
-                                    |
-                                 批量落库
-                                    |
-                                 table[q]
+
+消费流程分三段，每段之间隔一个缓冲区：
+
 ```
+after / network_buffer    中间件发出，还没到消费者
+consumer_queue            到了，还没开始处理
+func_buffer               正在处理
+```
+
+分开是为了让「传输乱序」和「处理乱序」能各自建模。
 
 ## 正确性
 
@@ -78,7 +80,7 @@ producer
 - 入队去重（同一个 uid 不会进两次）
 - 按组读取（组不会被拆到两个协程）
 - 消费端去重（重复到达不会重复处理）
-- 组冻结（收到 end 之后组不再变）
+- 组不分裂（冻结之后，同一组的事件不会分散在两个地方）
 
 ```bash
 cd spec
@@ -93,6 +95,7 @@ java -cp ~/tla2tools.jar tlc2.TLC -deadlock -config MQ.cfg MQ.tla
 - 没有事务消息
 - 窗口和超时靠约定，不保证跨机器时钟严格对齐
 - 规约里没有建模窗口的长度，只验证了"超时之后进死信"这个动作本身
+- `seq` 在规约里是自增的，表达不出「`end` 之后拒绝更大的 seq」，所以只能证「组不分裂」，证不了「组不再增长」
 
 ## 目录
 
