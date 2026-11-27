@@ -88,7 +88,6 @@ stateDiagram-v2
 | ---------------------------------- | --------------------------------------------------------- |
 | `SubmitToMiddleware`               | 写 `file`，`cache.uid` 加上新 uid，更新每组最大序号       |
 | `MoveEventFromFileToTable`         | `file` 按队列搬进 `table`                                 |
-| `ResubmitToMiddleware`             | 重投，靠 `cache.uid` 拦掉，期望永远不可执行               |
 | `Read`                             | 按组读，整组进 `before`                                   |
 | `DistributeToConsumer`             | 一组进 `after` 和 `network_buffer`，状态改 `Processing`   |
 | `FromNetWorkBufferToConsumerQueue` | 从 `network_buffer` 取一组进 `consumer_queue`             |
@@ -96,7 +95,7 @@ stateDiagram-v2
 | `HandleComplete` | 从 `func_buffer` 取一组，改状态追加进 `return_file`，失败时清去重 |
 | `UpdateTableWithProcessing`        | `after` 按 uid 补进 `table`                               |
 | `Freeze`                           | 记组冻结时的 uid 集合                                     |
-| `ReDistributeToConsumer`           | 空，只有注释                                              |
+| `Timeout` | 任意时刻把一组 `Pending` 的事件整体置成 `Dead` |
 
 ## 三段路，三种乱序
 
@@ -294,6 +293,45 @@ ON CONFLICT (uid) DO NOTHING
 
 `FrozenStable` 验证：`frozen` 里记着的组，不管事件走到哪，凑出来的 uid 集合都得和快照一样。
 
+## 超时
+
+`Timeout` 在任意时刻把一组 `Pending` 的事件整体置成 `Dead`。
+
+条件只有一条，`event.state = Pending`：
+
+```tla
+∃ q ∈ QUEUE: ∃ event ∈ table[q]:
+    ∧ event.state = Pending
+    ∧ LET event_group ≜ {x ∈ table[q]: x.group = event.group}
+      IN  table' = [table EXCEPT ![q] =
+              (@ \ event_group) ∪ {[e EXCEPT !.state = Dead]: e ∈ event_group}]
+```
+
+现实里触发条件是「窗口到了还没收集齐」，规约里没有计时，所以直接允许任意时刻触发。
+
+配套的是 `MoveEventFromFileToTable` 里那条：
+
+```tla
+dead_event_group ≜ {e.group: e ∈ table[q] ∧ e.state = Dead}
+processed_dead ≜ {IF e.group ∈ dead_event_group
+                  THEN [e EXCEPT !.state = Dead]
+                  ELSE e
+                  : e ∈ file[q]}
+```
+
+如果同组在表里已经死了，`file` 里来的新事件也直接写成 `Dead`。这样新消息跟不上组的终态，`ConsistentState` 就成立。
+
+## 去重表只增不减
+
+```tla
+CacheMonotonic ≜
+    [][∀ u ∈ cache.u: u ∈ cache'.u]_vars
+```
+
+入队去重表只加不减，因为 `SubmitToMiddleware` 只往里写。
+
+消费端的 `consumer_cache` 不一样，失败会清，所以没有对应这条。
+
 ## 组收齐的简化
 
 规约里只判 `end`，不判序号连续。
@@ -302,24 +340,11 @@ ON CONFLICT (uid) DO NOTHING
 
 ## 待改
 
-**还差一个「判定整组死信」的动作。**
-
-要能在任意时刻把某一组整体置成 `Dead`。触发条件大概是“组里有 Pending 的消息，但等不到 `end`”。
-
-配套的还有：判定之后，这个组新来的消息应该直接置 `Dead`，不再进正常流程。所以在 `SubmitToMiddleware` 里要加一条判断，同组已有 `Dead` 就直接跟着死。
-
-**`ReDistributeToConsumer` 现在是时序公式。**
-
-```tla
-[][∃ c ∈ CONSUMER: ∃ u ∈ consumer_cache[c]: TRUE => u ∈ consumer_cache'[c]]_vars
-```
-
-它断言的是“去重表只增不减”，不是动作。要么改成不变式，要么改成真动作，等你想清楚放哪。
+（暂时没有了，`Timeout` 和 `CacheMonotonic` 都写完了）
 
 ## 还没写的
 
 - `Next` 和 `Spec`
-- 安全性：`FrozenStable`、去重、状态单调
+- 安全性：`FrozenStable`、`ConsistentState`、`UidOnlyOnce`、`CacheMonotonic`
 - 活性：每个组最终收敛到 `Success` 或 `Dead`
-- `ReDistributeToConsumer`
 - cfg
