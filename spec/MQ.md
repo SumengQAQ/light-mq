@@ -272,20 +272,24 @@ DROP TEMPORARY TABLE tmp;
 
 ## 不用加锁
 
-`UpdateTableWithProcessing` 只插表里没有的 uid：
-
-```tla
-event.uid ∉ {x.uid: x ∈ table[q]}
-```
-
-消费者先写进去的 `Success` 不会被 `Processing` 覆盖。对应 SQL：
+`UpdateTableWithProcessing` 把 `after` 里的 `Processing` 写回表。但表里同一 uid 已经有一行了，入队时插的，所以这是更新不是插入：
 
 ```sql
-INSERT INTO domain_events (...) VALUES (...)
-ON CONFLICT (uid) DO NOTHING
+UPDATE domain_events SET state = 'Processing'
+WHERE uid = :uid AND state = 'Pending'
 ```
 
-加锁是把冲突挡在门外，状态机是把冲突变成"什么都没发生"。
+只有 `Pending` 才能改成 `Processing`。如果消费者已经抢先写成 `Success`，影响 0 行，跳过就行。
+
+规约里对应的是：
+
+```tla
+event.u ∉ {x.u: x ∈ table[q]}
+```
+
+只补表里没有的 uid，已经有了就不动。
+
+加锁是把冲突挡在门外，状态机是把冲突变成「什么都没发生」。
 
 ## 冻结（只能证「不分裂」，证不了「不再增长」）
 

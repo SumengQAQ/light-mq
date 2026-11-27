@@ -34,7 +34,7 @@
 
 同一组从 `Pending` 到终态只会走一次，靠状态机挡：
 
-- 落库时 `ON CONFLICT (uid) DO NOTHING`，已经有的不覆盖
+- 落库时按 uid 逐条 UPDATE，带上状态和 retry 条件，不该写的更新 0 行
 - 消费者返回时，只有 `Processing` 才能转终态
 
 ## 快速开始
