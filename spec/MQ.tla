@@ -128,9 +128,7 @@ SubmitToMiddleware(queue, group, end) ≜
 \* 而且如果发现这个组已经超时了，写入的时候直接写成Dead，保证ConsistentState
 MoveEventFromFileToTable ≜
     ∧ ∃ q ∈ QUEUE: file[q] ≠ {}
-    ∧ LET   dead_event_group ≜ {event.group: event ∈ {x ∈ table[q]: x.state = Dead}}
-            processed_dead ≜ {IF event.group ∈ dead_event_group THEN [event EXCEPT !.state = Dead] ELSE event: event ∈ file[q]}
-      IN    ∧ table' = [x ∈ QUEUE ↦
+    ∧ table' = [x ∈ QUEUE ↦
                 LET dead_event ≜ {e ∈ table[x]: e.state = Dead}
                     dead_group ≜ {e.group: e ∈ dead_event}
                     processed ≜ {
@@ -140,7 +138,7 @@ MoveEventFromFileToTable ≜
                         : e ∈ file[x]
                     }
                 IN table[x] ∪ processed]
-            ∧ file' = [q ∈ QUEUE ↦ {}]
+    ∧ file' = [q ∈ QUEUE ↦ {}]
             ∧ UNCHANGED ⟨consumer_queue, uid, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
 
 \* 重投已经发过的 uid。
@@ -178,7 +176,7 @@ DistributeToConsumer(goroutine, consumer) ≜
     ∧ before[goroutine] ≠ {}
     ∧ ∃ event_group ∈ before[goroutine]:
         LET in_processing ≜ {[event EXCEPT !.state = Processing] : event ∈ event_group}
-        IN  ∧ network_buffer' = [network_buffer EXCEPT ![consumer] = @ ∪ {in_processing]
+        IN  ∧ network_buffer' = [network_buffer EXCEPT ![consumer] = @ ∪ {in_processing}]
             ∧ before' = [before EXCEPT ![goroutine] = @ \ {event_group}]
             ∧ after' = [after EXCEPT ![goroutine] = @ ∪ {in_processing}]
     ∧ UNCHANGED ⟨uid, file, return_file, table, cache, consumer_cache, frozen, func_buffer⟩
@@ -331,7 +329,7 @@ Timeout ≜
         \* ConsistentState：同一个组里的事件状态都一样
         ∧ event.state = Pending
         ∧ LET event_group ≜ {x ∈ table[q]: x.group = event.group}
-          IN  ∧ table' = [table EXCEPT ![q] = (@ \ event_group) ∪ {[event EXCEPT !.state = Dead]: event ∈ event_group}]
+          IN  ∧ table' = [table EXCEPT ![q] = (@ \ event_group) ∪ {[e EXCEPT !.state = Dead]: e ∈ event_group}]
               ∧ UNCHANGED ⟨consumer_queue, uid, file, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
 
 \* ---------------------------------------------------------------------------

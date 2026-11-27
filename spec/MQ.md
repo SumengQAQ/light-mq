@@ -312,14 +312,21 @@ ON CONFLICT (uid) DO NOTHING
 配套的是 `MoveEventFromFileToTable` 里那条：
 
 ```tla
-dead_event_group ≜ {e.group: e ∈ table[q] ∧ e.state = Dead}
-processed_dead ≜ {IF e.group ∈ dead_event_group
-                  THEN [e EXCEPT !.state = Dead]
-                  ELSE e
-                  : e ∈ file[q]}
+table' = [x ∈ QUEUE ↦
+      LET dead_event ≜ {e ∈ table[x]: e.state = Dead}
+          dead_group ≜ {e.group: e ∈ dead_event}
+          processed ≜ {IF e.group ∈ dead_group
+                       THEN [e EXCEPT !.state = Dead]
+                       ELSE e
+                       : e ∈ file[x]}
+      IN table[x] ∪ processed]
 ```
 
-如果同组在表里已经死了，`file` 里来的新事件也直接写成 `Dead`。这样新消息跟不上组的终态，`ConsistentState` 就成立。
+`dead_event` 先筛出表里已经死的，`dead_group` 再把这些组的组号取出来，最后对 `file` 里每一条判断要不要跟着死。
+
+每个队列各自算一遍，所以 `[x ∈ QUEUE ↦ ...]` 里面套 `LET`。
+
+如果同组在表里已经死了，`file` 里来的新事件也直接写成 `Dead`。这样新消息进来就跟上组的终态，`ConsistentState` 才成立。
 
 ## 去重表只增不减
 
