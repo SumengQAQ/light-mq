@@ -57,7 +57,7 @@ flowchart LR
 ```tla
 [u     ↦ 1‥MAX_UID,
  queue ↦ QUEUE,
- group ↦ 1‥MAX_GROUP,
+ group ↦ GROUPS,
  state ↦ Pending | Processing | Success | Failed | Dead,
  seq   ↦ 1‥MAX_UID,
  retry ↦ 0‥MAX_RETRY,
@@ -96,6 +96,7 @@ stateDiagram-v2
 | `UpdateTableWithProcessing`        | `after` 按 uid 补进 `table`                               |
 | `Freeze`                           | 记组冻结时的 uid 集合                                     |
 | `Timeout` | 任意时刻把一组 `Pending` 的事件整体置成 `Dead` |
+| `AllEventInTerminal` | 守卫：所有事件都到终态时允许 stutter |
 
 ## 三段路，三种乱序
 
@@ -111,6 +112,31 @@ func_buffer --HandleComplete--> return_file   处理完，先写返回 WAL
 **处理乱序** 靠 `func_buffer`。一组进了 `func_buffer` 表示"正在处理"，什么时候出来由 `HandleComplete` 决定，任意时刻都行。
 
 **发送方乱序** 交给上游，规约里用 `∃` 表示"任意一组"。
+
+## 按组读的守卫
+
+`Read` 挑组的时候要同时满足四条：
+
+```tla
+∧ event.state ∈ {Pending, Failed}
+∧ ∃ end_event ∈ the_group_events: end_event.end = TRUE
+∧ ¬(∃ other ∈ GOROUTINES \ {goroutine}:
+      the_group_events ∈ before[other] ∨ in_processing ∈ after[other])
+∧ in_processing ∉ after[goroutine]
+```
+
+前两条是「这组能读」，后两条是「这组不在任何人手里」。
+
+第三条和第四条分开写，是因为 `before` 和 `after` 里存的东西不一样：
+
+```
+before   原始状态，Pending
+after    改成 Processing 之后的
+```
+
+同一个组在两个地方的值不相等，所以 `after` 那边要拿 `in_processing` 去比。
+
+第四条是跑出来的反例补上的。一个协程自己也可能重复读：`before` 里的组被分走之后，`table` 里还是 `Pending`（`UpdateTableWithProcessing` 还没执行），这时再调 `Read`，前三条都满足，又能读一遍。
 
 ## 消费端去重
 
@@ -272,22 +298,36 @@ DROP TEMPORARY TABLE tmp;
 
 ## 不用加锁
 
-`UpdateTableWithProcessing` 把 `after` 里的 `Processing` 写回表。但表里同一 uid 已经有一行了，入队时插的，所以这是更新不是插入：
+`UpdateTableWithProcessing` 把 `after` 里的 `Processing` 写回表。但表里同一 uid 已经有一行了，入队时插的，所以这是更新不是插入。
+
+一开始写成了「只补表里没有的 uid」：
+
+```tla
+event.u ∉ {x.u: x ∈ table[q]}
+```
+
+这条是错的。事件本来就在表里，条件永远不成立，一条都插不进去，`Pending` 永远变不成 `Processing`。
+
+正确的写法是按状态挑：
+
+```tla
+∧ table' = [q ∈ QUEUE ↦
+      LET after_uid ≜ {e.u: e ∈ UNION after[goroutine]}
+          in_pending ≜ {e ∈ table[q]: e.state = Pending ∧ e.u ∈ after_uid}
+      IN  (table[q] \ in_pending)
+          ∪ {[e EXCEPT !.state = Processing]: e ∈ in_pending}]
+```
+
+`after` 里的状态一定是 `Processing`，表里的可能是 `Pending`、`Failed`、`Success`、`Dead` 任意一种。`Processing` 只能覆盖 `Pending`。
+
+对应 SQL：
 
 ```sql
 UPDATE domain_events SET state = 'Processing'
 WHERE uid = :uid AND state = 'Pending'
 ```
 
-只有 `Pending` 才能改成 `Processing`。如果消费者已经抢先写成 `Success`，影响 0 行，跳过就行。
-
-规约里对应的是：
-
-```tla
-event.u ∉ {x.u: x ∈ table[q]}
-```
-
-只补表里没有的 uid，已经有了就不动。
+影响 0 行说明已经被别人改过，跳过。
 
 加锁是把冲突挡在门外，状态机是把冲突变成「什么都没发生」。
 
@@ -326,6 +366,8 @@ event.u ∉ {x.u: x ∈ table[q]}
 
 现实里触发条件是「窗口到了还没收集齐」，规约里没有计时，所以直接允许任意时刻触发。
 
+配套的还有 `SubmitToMiddleware` 开头那条：`table` 里同组已经有 `end` 的话，新消息进不来。没有它，`end` 之后的迟到消息会把已经冻结的组撑大。
+
 配套的是 `MoveEventFromFileToTable` 里那条：
 
 ```tla
@@ -345,6 +387,40 @@ table' = [x ∈ QUEUE ↦
 
 如果同组在表里已经死了，`file` 里来的新事件也直接写成 `Dead`。这样新消息进来就跟上组的终态，`ConsistentState` 才成立。
 
+## 活性
+
+```tla
+FinalConvergence ≜ ◇□(∀ q ∈ QUEUE: ∀ e ∈ table[q]: e.state ∈ Terminal)
+```
+
+最终所有事件都在 `table` 里，而且状态是终态。
+
+这条没有外层量词，`◇□` 直接套状态谓词，最省事。之前写成 `∀ event ∈ table[q]: ◇□(...)` 会报错，因为量词域是变量，TLC 没法把公式编译成自动机。
+
+成立的依赖两个东西：
+
+- 每个动作都有 `WF_vars`，不然它可以一直不被调度
+- `Timeout` 能在任意时刻把卡住的组推进 `Dead`
+
+## 对称性
+
+```tla
+Symmetry == Permutations(QUEUE) ∪ Permutations(CONSUMER)
+          ∪ Permutations(GOROUTINES) ∪ Permutations(GROUPS)
+```
+
+队列、消费者、协程、组之间都是对称的，`{Q1, Q2}` 和 `{Q2, Q1}` 在语义上没有区别。
+
+TLC 用这个把对称的状态去重，状态数能降一大截。
+
+注意 `SYMMETRY` 要求的是一个置换群。几个 `Permutations` 直接并起来不一定还是群，得确认这些集合两两不相交，或者用别的方式构造。
+
+cfg 里对应一行：
+
+```
+SYMMETRY Symmetry
+```
+
 ## 去重表只增不减
 
 ```tla
@@ -362,13 +438,39 @@ CacheMonotonic ≜
 
 简化掉两件事：`end` 之后又来消息的拒绝逻辑、窗口长度。两件都不和主流程纠缠。
 
-## 待改
+## 还没解决的
 
-（暂时没有了，`Timeout` 和 `CacheMonotonic` 都写完了）
+**`DedupOnlyForLiveOrSuccess` 现在不成立。**
+
+新的竞态：`return_file` 里已经是 `Success`，但还没落库，数据库里这一行还是 `Failed`。这时候别的协程把它读出来处理了一遍。
+
+因为消费者有去重，重复处理不会再产生副作用，实际上没关系。但不变式是按「表里或 WAL 里是终态」写的，这个时间窗口里两边都不是，就被判违反了。
+
+要写准确，得把「还没落库的终态」也算进去，同时考虑各种交错，不是一条短的不变式能覆盖的。先放着。
+
+**`AllEventInTerminal` 有点多余。**
+
+```tla
+AllEventInTerminal ≜
+    ∧ ∀ q ∈ QUEUE: ∀ event ∈ table[q]: event.state ∈ Terminal
+    ∧ UNCHANGED vars
+```
+
+它只是「所有事件都终态时允许不动」，而 `[][Next]_vars` 本来就允许 stuttering。放在 `Next` 里不影响正确性，但也没什么用。
+
+**cfg 里的常量没加引号。**
+
+```
+QUEUE = {Q1, Q2}
+GROUPS = {GR1, GR2}
+```
+
+`Q1` 在没定义的情况下会被当成未声明的常量，直接报错。应该是 `{"Q1", "Q2"}`。
+
+**`Symmetry` 的合法性要确认。**
+
+`Permutations(A) ∪ Permutations(B)` 只有在两个集合不相交的时候才是群。四个并起来如果不满足，TLC 会报错或者静默用错。
 
 ## 还没写的
 
-- `Next` 和 `Spec`
-- 安全性：`FrozenStable`、`ConsistentState`、`UidOnlyOnce`、`CacheMonotonic`
-- 活性：每个组最终收敛到 `Success` 或 `Dead`
-- cfg
+- 活性：`FinalConvergence` 接进 cfg 的 `PROPERTY`

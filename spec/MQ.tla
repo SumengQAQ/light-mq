@@ -9,12 +9,12 @@
 \*   file[q]  ---MoveEventFromFileToTable--->  table[q]
 \*                                                |
 \*                                               Read
-\*                                                |
-\*                                                v
-\*                                  before[g] (整组)
+\*|
+\*v
+\*before[g] (整组)
 \*                                        |
 \*                              DistributeToConsumer
-\*                                   /          \
+\*      /          \
 \*                                  v            v
 \*                            after[g]      consumer_queue[c]
 \*                                  |              |
@@ -33,11 +33,11 @@
 \* 还没写的：Next、Spec、安全性、活性、cfg。
 \* 还在改的：分发拆成两步（缓冲区）、消费者的 in_progress 标记、consumer_cache 去重。
 
-EXTENDS Integers, Bags, FiniteSets
+EXTENDS Integers, Bags, FiniteSets, TLC
 
 VARIABLES consumer_queue, uid, file, return_file, table, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer
 
-CONSTANTS QUEUE, CONSUMER, GOROUTINES, MAX_UID, MAX_GROUP, MAX_RETRY
+CONSTANTS QUEUE, CONSUMER, GOROUTINES, GROUPS, MAX_UID, MAX_RETRY
 
 vars ≜ ⟨consumer_queue, uid, file, return_file, table, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
 
@@ -56,7 +56,7 @@ Terminal ≜ {Success, Dead}
 Event ≜ [
     u: 1‥MAX_UID,
     queue: QUEUE,
-    group: 1‥MAX_GROUP,
+    group: GROUPS,
     state: {Pending, Processing, Success, Failed, Dead},
     seq: 1‥MAX_UID,
     retry: 0‥MAX_RETRY,
@@ -65,10 +65,17 @@ Event ≜ [
 
 \* 所有装着事件的地方，元素都必须是合法的 Event
 Constraint ≜
-    ∧ ∀ c ∈ CONSUMER: UNION consumer_queue[c] ⊆ Event
+    ∧ ∀ c ∈ CONSUMER:
+        ∧ UNION consumer_queue[c] ⊆ Event
+        ∧ UNION network_buffer[c] ⊆ Event
+        ∧ UNION func_buffer[c] ⊆ Event
     ∧ ∀ g ∈ GOROUTINES:
         ∧ UNION before[g] ⊆ Event
         ∧ UNION after[g] ⊆ Event
+    ∧ ∀ q ∈ QUEUE:
+        ∧ file[q] ⊆ Event
+        ∧ table[q] ⊆ Event
+        ∧ return_file[q] ⊆ Event
 
 Init ≜
     ∧ consumer_queue = [c ∈ CONSUMER ↦ {}]
@@ -95,12 +102,14 @@ Init ≜
 \* 首次出现的组从 seq = 1 开始，之后每条递增。
 \* 这里假设 end 之后不会再投，真实现要用 seq <= end_seq 挡掉。
 SubmitToMiddleware(queue, group, end) ≜
+    ∧ ¬(∃ event ∈ table[queue]: event.group = group ∧ event.end = TRUE)
     ∧ ∨ ∧ ⟨queue, group⟩ ∉ DOMAIN cache.max_event_seq
           ∧ LET new_seq ≜ 1
                 new_uid ≜ uid + 1
                 event ≜ [u ↦ new_uid, queue ↦ queue, group ↦ group,
                          state ↦ Pending, seq ↦ new_seq, retry ↦ 0, end ↦ end]
-            IN  ∧ new_uid ∉ cache.u 
+            IN  ∧ new_uid ≤ MAX_UID
+                ∧ new_uid ∉ cache.u 
                 ∧ uid' = new_uid
                 ∧ file' = [file EXCEPT ![queue] = @ ∪ {event}]
                 ∧ cache' = [cache EXCEPT !.u = @ ∪ {new_uid}, !.max_event_seq = @ @@ ⟨queue, group⟩ :> 1]
@@ -110,7 +119,9 @@ SubmitToMiddleware(queue, group, end) ≜
                 new_uid ≜ uid + 1
                 event ≜ [u ↦ new_uid, queue ↦ queue, group ↦ group,
                          state ↦ Pending, seq ↦ new_seq, retry ↦ 0, end ↦ end]
-            IN  ∧ new_uid ∉ cache.u
+            IN  
+                ∧ new_uid ≤ MAX_UID
+                ∧ new_uid ∉ cache.u
                 ∧ uid' = new_uid
                 ∧ file' = [file EXCEPT ![queue] = @ ∪ {event}]
                 ∧ cache' = [cache EXCEPT !.u = @ ∪ {new_uid}, !.max_event_seq[⟨queue, group⟩] = @ + 1]
@@ -120,6 +131,17 @@ SubmitToMiddleware(queue, group, end) ≜
 \* ---------------------------------------------------------------------------
 \* 落库
 \* ---------------------------------------------------------------------------
+
+\* 组第一次出现 end 的时候，把当时的 uid 集合记下来。
+\*
+\* 已经在 frozen 里的组不覆盖，只补新出现的。配合 MoveEventFromFileToTable 一起用。
+FreezeBody ≜
+    LET new_end_group ≜ {⟨q, g⟩ ∈ QUEUE × GROUPS:
+            ∃ event ∈ file[q]: event.group = g ∧ event.end = TRUE}
+    IN  frozen' = [k ∈ DOMAIN frozen ∪ new_end_group ↦
+                IF k ∈ DOMAIN frozen
+                THEN frozen[k]
+                ELSE {x.u: x ∈ {event ∈ table'[k[1]]: event.group = k[2]}}]
 
 \* 把文件里的事件批量写进数据库，然后清空文件。
 \*
@@ -139,14 +161,8 @@ MoveEventFromFileToTable ≜
                     }
                 IN table[x] ∪ processed]
     ∧ file' = [q ∈ QUEUE ↦ {}]
-    ∧ UNCHANGED ⟨consumer_queue, uid, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
-
-\* 重投已经发过的 uid。
-\*
-\* 这条路径靠 cache.u 直接拦掉，不存在成功的情况。
-\* 指的是「投递成功但没收到 ack」的重投。发件箱那边消息在路上丢了，由发件箱自己重试，规约不涉及。
-CacheMonotonic ≜
-    [][∀ u ∈ cache.u: u ∈ cache'.u]_vars
+    ∧ FreezeBody
+    ∧ UNCHANGED ⟨consumer_queue, uid, return_file, cache, consumer_cache, before, after, network_buffer, func_buffer⟩
 
 \* ---------------------------------------------------------------------------
 \* 读和分发
@@ -160,9 +176,11 @@ Read(goroutine) ≜
     ∃ queue ∈ QUEUE: ∃ event ∈ table[queue]:
         ∧ event.state ∈ {Pending, Failed}
         ∧ LET the_group_events ≜ {x ∈ table[queue]: x.group = event.group}
+              in_processing ≜ {[e EXCEPT !.state = Processing]: e ∈ the_group_events}
           IN  ∧ ∃ end_event ∈ the_group_events: end_event.end = TRUE
-              ∧ ¬(∃ other ∈ GOROUTINES \ {goroutine}:
-                    the_group_events ∈ before[other] ∨ the_group_events ∈ after[other])
+              ∧ ¬(∃ other ∈ GOROUTINES \ {goroutine}: the_group_events ∈ before[other] ∨ in_processing ∈ after[other])
+              \* 而且不能在自己的after中！测试出来的反例
+              ∧ in_processing ∉ after[goroutine]
               ∧ before' = [before EXCEPT ![goroutine] = @ ∪ {the_group_events}]
     ∧ UNCHANGED ⟨consumer_queue, uid, file, return_file, table, cache, consumer_cache, after, frozen, network_buffer, func_buffer⟩
 
@@ -175,12 +193,11 @@ Read(goroutine) ≜
 DistributeToConsumer(goroutine, consumer) ≜
     ∧ before[goroutine] ≠ {}
     ∧ ∃ event_group ∈ before[goroutine]:
-        LET in_processing ≜ {[event EXCEPT !.state = Processing] : event ∈ event_group}
+        LET in_processing ≜ {[event EXCEPT !.state = Processing]: event ∈ event_group}
         IN  ∧ network_buffer' = [network_buffer EXCEPT ![consumer] = @ ∪ {in_processing}]
             ∧ before' = [before EXCEPT ![goroutine] = @ \ {event_group}]
             ∧ after' = [after EXCEPT ![goroutine] = @ ∪ {in_processing}]
-    ∧ UNCHANGED ⟨uid, file, return_file, table, cache, consumer_cache, frozen, func_buffer⟩
-
+    ∧ UNCHANGED ⟨consumer_queue, uid, file, return_file, table, cache, consumer_cache, frozen, func_buffer⟩
 
 FromNetWorkBufferToConsumerQueue(consumer) ≜
     ∧ network_buffer[consumer] ≠ {}
@@ -193,12 +210,22 @@ FromNetWorkBufferToConsumerQueue(consumer) ≜
 \*
 \* 只插表里还没有的 uid，已经存在的一律跳过。这样消费者先写进去的 Success
 \* 不会被这里的 Processing 覆盖。等价于 INSERT ... ON CONFLICT DO NOTHING。
+
+\* 谁让你直接跳过的？这样就没办法把Pending变成Processing了！！！
+\* 这里也要用条件更新，首先after中的状态只有Processing，数据库中的状态可能是Pending, Fail, Success, Dead中任意一种
+\* Processing只能覆盖Pending
+
 UpdateTableWithProcessing(goroutine) ≜
     ∧ before[goroutine] = {} ∧ after[goroutine] ≠ {}
     ∧ after' = [after EXCEPT ![goroutine] = {}]
-    ∧ table' = [q ∈ QUEUE ↦ table[q] ∪
-            {event ∈ UNION after[goroutine]:
-                event.queue = q ∧ event.u ∉ {x.u: x ∈ table[q]}}]
+    \*∧ table' = [q ∈ QUEUE ↦ table[q] ∪
+    \*        {event ∈ UNION after[goroutine]:
+    \*           event.queue = q ∧ event.u ∉ {x.u: x ∈ table[q]}}]
+    ∧ table' = [q ∈ QUEUE ↦ 
+                LET after_uid ≜ {event.u: event ∈ UNION after[goroutine]}
+                    in_pending ≜ {event ∈ table[q]: event.state = Pending ∧ event.u ∈ after_uid}
+                IN  (table[q] \ in_pending) ∪ {[event EXCEPT !.state = Processing]: event ∈ in_pending}
+            ]
     ∧ UNCHANGED ⟨consumer_queue, uid, file, return_file, cache, consumer_cache, before, frozen, network_buffer, func_buffer⟩
 
 \* 模拟消费者返回结果。
@@ -235,7 +262,7 @@ HandleComplete(consumer) ≜
                         @ ∪ {[event EXCEPT !.state = Failed, !.retry = @ + 1]: event ∈ event_group}]
                        \* 如果是失败了，就把这些uid从自己的去重表中清理掉
                        ∧ consumer_cache' = [consumer_cache EXCEPT ![consumer] = @ \ {event.u: event ∈ event_group}]
-    ∧ UNCHANGED ⟨consumer_queue, uid, file, cache, before, after, frozen, network_buffer⟩
+    ∧ UNCHANGED ⟨consumer_queue, uid, file, table, cache, before, after, frozen, network_buffer⟩
 
 \* 网络乱序没建模，但实现里会遇到：
 \*   处理失败、清了去重表，发回复 A，网络卡住
@@ -265,27 +292,32 @@ WriteResultToTable ≜
     ∧ return_file' = [x ∈ QUEUE ↦ {}]
     ∧ UNCHANGED ⟨consumer_queue, uid, file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
 
-DedupOnlyForLiveOrSuccess ≜
-    ∀ c ∈ CONSUMER: ∀ u ∈ consumer_cache[c]:
-        ∨ (∃ eg ∈ func_buffer[c]: ∃ e ∈ eg: e.u = u)
-        ∨ (∃ q ∈ QUEUE: ∃ e ∈ table[q]: e.u = u ∧ e.state ∈ Terminal)
-        ∨ (∃ q ∈ QUEUE: ∃ e ∈ return_file[q]: e.u = u ∧ e.state ∈ Terminal)
+Timeout ≜
+    \* 直接找数据库中不带end的消息组，然后给整组设置为Dead
+    \* 实现是时候就算带了end的消息组也不一定是完整的，照样可能会超时
+    \* 但是超时只是针对不完整的组，读取只会读完整的组，不需要担心竞态的问题
+    \* 只是实现的时候超时并不只是看没有end的组，就算有了end，但是太长时间没有补齐之前的事件，一样会超时
+    ∃ q ∈ QUEUE: ∃ event ∈ table[q]:
+        \* ConsistentState：同一个组里的事件状态都一样
+        ∧ event.state = Pending
+        ∧ LET event_group ≜ {x ∈ table[q]: x.group = event.group}
+          IN  ∧ table' = [table EXCEPT ![q] = (@ \ event_group) ∪ {[e EXCEPT !.state = Dead]: e ∈ event_group}]
+              ∧ UNCHANGED ⟨consumer_queue, uid, file, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
+
+AllEventInTermainal ≜ 
+    ∧ ∀ q ∈ QUEUE: ∀ event ∈ table[q]: event.state ∈ Terminal
+    ∧ UNCHANGED vars
 
 \* ---------------------------------------------------------------------------
 \* 冻结
 \* ---------------------------------------------------------------------------
 
-\* 组第一次出现 end 的时候，把当时的 uid 集合记下来。
-\*
-\* 已经在 frozen 里的组不覆盖，只补新出现的。配合 MoveEventFromFileToTable 一起用。
-Freeze ≜
-    LET new_end_group ≜ {⟨q, g⟩ ∈ QUEUE × (1‥MAX_GROUP):
-            ∃ event ∈ file[q]: event.group = g ∧ event.end = TRUE}
-    IN  ∧ frozen' = [k ∈ DOMAIN frozen ∪ new_end_group ↦
-                IF k ∈ DOMAIN frozen
-                THEN frozen[k]
-                ELSE {x.u: x ∈ {event ∈ table'[k[1]]: event.group = k[2]}}]
-        ∧ UNCHANGED ⟨consumer_queue, uid, file, table, cache, consumer_cache, before, after, network_buffer, func_buffer⟩
+\* 安全性
+DedupOnlyForLiveOrSuccess ≜
+    ∀ c ∈ CONSUMER: ∀ u ∈ consumer_cache[c]:
+        ∨ (∃ eg ∈ func_buffer[c]: ∃ e ∈ eg: e.u = u)
+        ∨ (∃ q ∈ QUEUE: ∃ e ∈ table[q]: e.u = u ∧ e.state ∈ Terminal)
+        ∨ (∃ q ∈ QUEUE: ∃ e ∈ return_file[q]: e.u = u ∧ e.state ∈ Terminal)
 
 \* 冻结之后，这个组不管走到哪，凑出来的 uid 集合都不变。
 \*
@@ -293,15 +325,15 @@ Freeze ≜
 FrozenStable ≜
     ∀ ⟨q, g⟩ ∈ DOMAIN frozen:
         LET event_in_table ≜ {event ∈ table[q]: event.group = g}
-            event_in_before ≜ {event ∈ UNION {before[gr]: gr ∈ GOROUTINES}:
+            event_in_before ≜ {event ∈ UNION UNION({before[gr]: gr ∈ GOROUTINES}):
                                     event.queue = q ∧ event.group = g}
-            event_in_after ≜ {event ∈ UNION {after[gr]: gr ∈ GOROUTINES}:
+            event_in_after ≜ {event ∈ UNION UNION({after[gr]: gr ∈ GOROUTINES}):
                                    event.queue = q ∧ event.group = g}
-            event_in_consumer_queue ≜ {event ∈ UNION {consumer_queue[cc]: cc ∈ CONSUMER}:
+            event_in_consumer_queue ≜ {event ∈ UNION UNION({consumer_queue[cc]: cc ∈ CONSUMER}):
                                            event.queue = q ∧ event.group = g}
-            event_in_network ≜ {event ∈ UNION {network_buffer[cc]: cc ∈ CONSUMER}:
+            event_in_network ≜ {event ∈ UNION UNION({network_buffer[cc]: cc ∈ CONSUMER}):
                                     event.queue = q ∧ event.group = g}
-            event_in_func ≜ {event ∈ UNION {func_buffer[cc]: cc ∈ CONSUMER}:
+            event_in_func ≜ {event ∈ UNION UNION({func_buffer[cc]: cc ∈ CONSUMER}):
                                     event.queue = q ∧ event.group = g}
             target ≜ frozen[⟨q, g⟩]
         IN  ∧ {x.u: x ∈ event_in_table} = target
@@ -320,17 +352,47 @@ UidOnlyOnce ≜
     ∀ q ∈ QUEUE:
         Cardinality(table[q]) = Cardinality({x.u: x ∈ table[q]})
 
-Timeout ≜
-    \* 直接找数据库中不带end的消息组，然后给整组设置为Dead
-    \* 实现是时候就算带了end的消息组也不一定是完整的，照样可能会超时
-    \* 但是超时只是针对不完整的组，读取只会读完整的组，不需要担心竞态的问题
-    \* 只是实现的时候超时并不只是看没有end的组，就算有了end，但是太长时间没有补齐之前的事件，一样会超时
-    ∃ q ∈ QUEUE: ∃ event ∈ table[q]:
-        \* ConsistentState：同一个组里的事件状态都一样
-        ∧ event.state = Pending
-        ∧ LET event_group ≜ {x ∈ table[q]: x.group = event.group}
-          IN  ∧ table' = [table EXCEPT ![q] = (@ \ event_group) ∪ {[e EXCEPT !.state = Dead]: e ∈ event_group}]
-              ∧ UNCHANGED ⟨consumer_queue, uid, file, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
+\* 活性
+FinalConvergence ≜ ◇□(∀ q ∈ QUEUE: ∀ e ∈ table[q]: e.state ∈ Terminal)
+
+\* 重投已经发过的 uid。
+\*
+\* 这条路径靠 cache.u 直接拦掉，不存在成功的情况。
+\* 指的是「投递成功但没收到 ack」的重投。发件箱那边消息在路上丢了，由发件箱自己重试，规约不涉及。
+CacheMonotonic ≜
+    [][∀ u ∈ cache.u: u ∈ cache'.u]_vars
+
+
+Symmetry == Permutations(QUEUE) ∪ Permutations(CONSUMER) ∪ Permutations(GOROUTINES) ∪ Permutations(GROUPS)
+
+Next ≜
+    ∨ ∃ q ∈ QUEUE: ∃ g ∈ GROUPS: ∃ end ∈ BOOLEAN: SubmitToMiddleware(q, g, end)
+    ∨ MoveEventFromFileToTable
+    ∨ ∃ g ∈ GOROUTINES: Read(g) ∨ UpdateTableWithProcessing(g)
+    ∨ ∃ g ∈ GOROUTINES: ∃ c ∈ CONSUMER: DistributeToConsumer(g, c)
+    ∨ ∃ c ∈ CONSUMER: FromNetWorkBufferToConsumerQueue(c) ∨ ConsumerHandleEvent(c) ∨ HandleComplete(c)
+    ∨ WriteResultToTable
+    ∨ Timeout
+    ∨ AllEventInTermainal
+
+Spec ≜
+    ∧ Init
+    ∧ [][Next]_vars
+    ∧ WF_vars(∃ q ∈ QUEUE: ∃ g ∈ GROUPS: ∃ end ∈ BOOLEAN: SubmitToMiddleware(q, g, end))
+    ∧ WF_vars(MoveEventFromFileToTable)
+    ∧ WF_vars(∃ g ∈ GOROUTINES: Read(g))
+    ∧ WF_vars(∃ g ∈ GOROUTINES: UpdateTableWithProcessing(g))
+    ∧ WF_vars(∃ g ∈ GOROUTINES: ∃ c ∈ CONSUMER: DistributeToConsumer(g, c))
+    ∧ WF_vars(∃ c ∈ CONSUMER: FromNetWorkBufferToConsumerQueue(c))
+    ∧ WF_vars(∃ c ∈ CONSUMER: ConsumerHandleEvent(c))
+    ∧ WF_vars(∃ c ∈ CONSUMER: HandleComplete(c))
+    ∧ WF_vars(WriteResultToTable)
+    ∧ WF_vars(Timeout)
+
+\* 新的竞态，如果return_file里面是Suceess，但是还没来的及写入数据库，数据库此时是Fail，这时候会被其他的协程读取到
+\* 但是既然是success了，那被读取到了再发送也无所谓的，因为消费者做了去重
+\* 但是在这种情况下，这个DedupOnlyForLiveOrSuccess不变式就通过不了了……先去掉这个不变式吧
+\* 如果要写的话，确实是比较难写，因为这里不是简单的不变式，而是需要考虑各种竞态的情况
 
 \* ---------------------------------------------------------------------------
 \* 实现笔记（不进模型，实现时参考）
