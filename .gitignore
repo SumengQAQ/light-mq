@@ -1,8 +1,3 @@
-# 工作副本，不进仓库
-MQ.tla
-MQ_organized.tla
-MQ.md
-
 # TLC 产物
 spec/states/
 spec/*_TTrace_*
