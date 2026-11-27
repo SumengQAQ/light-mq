@@ -178,7 +178,98 @@ B 先写库，A 后到，把 B 的结果覆盖了
 
 `retry` 那条是为了挡住“旧的重试结果覆盖新的”。`Success` 和 `Dead` 互斥，不会再有后续状态，所以优先级最高。
 
-规约没建模这段乱序，条件更新也就没写进去。
+规约里这段乱序没建模，条件更新对应的是 `PickOne`：在内存里按 uid 挑一条，同一 uid 只留一个写。
+
+## 落库的 SQL
+
+### PickOne
+
+内存里按 uid 聚合，每个 uid 只留一条：
+
+```tla
+PickOne(S, u) ≜
+    IF ∃ e ∈ S: e.u = u ∧ e.state ∈ {Success, Dead}
+    THEN CHOOSE e ∈ S: e.u = u ∧ e.state ∈ {Success, Dead}
+    ELSE CHOOSE e ∈ S: e.u = u ∧ ¬(∃ f ∈ S: f.u = u ∧ f.retry > e.retry)
+```
+
+有终态挑终态，没有就挑 retry 最大的。这一步就是「条件更新」在规约里的对应，落库时每个 uid 只有一行要写。
+
+### 逐条写
+
+最简单，一批消息发 N 条：
+
+```sql
+UPDATE domain_events SET state = ?, retry = ?
+WHERE uid = ?
+  AND state IN ('Processing', 'Failed')
+  AND retry < ?;
+```
+
+`WHERE uid = ?` 找到那一行，后面两个条件挡住两种不该写的情况：
+
+```
+已经是 Success 或 Dead    state IN (...) 不满足
+表里的 retry 更大         retry < ? 不满足
+```
+
+影响 0 行就跳过，不报错。
+
+### 按状态分组
+
+成功和死信不用比 retry，可以一批一条：
+
+```sql
+UPDATE domain_events SET state = 'Success'
+WHERE uid IN (?, ?, ...) AND state IN ('Processing', 'Failed');
+
+UPDATE domain_events SET state = 'Dead'
+WHERE uid IN (?, ?, ...) AND state IN ('Processing', 'Failed');
+```
+
+失败要逐行比 retry，按 retry 分组。`retry` 只可能是 0 到 `MAX_RETRY`，所以最多几条语句：
+
+```sql
+UPDATE domain_events SET state = 'Failed', retry = 2
+WHERE uid IN (?, ?, ...) AND state IN ('Processing', 'Failed') AND retry < 2;
+
+UPDATE domain_events SET state = 'Failed', retry = 3
+WHERE uid IN (?, ?, ...) AND state IN ('Processing', 'Failed') AND retry < 3;
+```
+
+### 临时表
+
+还想压成一条语句，就用临时表加 JOIN：
+
+```sql
+CREATE TEMPORARY TABLE tmp (
+    uid BIGINT PRIMARY KEY,
+    retry INT NOT NULL
+);
+
+INSERT INTO tmp (uid, retry) VALUES (?, ?), (?, ?), (?, ?);
+
+UPDATE domain_events d
+JOIN tmp t ON d.uid = t.uid
+SET d.state = 'Failed', d.retry = t.retry
+WHERE d.state IN ('Processing', 'Failed') AND t.retry > d.retry;
+
+DROP TEMPORARY TABLE tmp;
+```
+
+`UPDATE ... JOIN` 的意思是：两张表按 `uid` 配对，拿临时表的值去改业务表。不是查询，是「一边对一边改」。
+
+`TEMPORARY` 表只在当前连接可见，连接断了自动删。
+
+代价是多两次往返（建表、灌数据），所以只有批量大或者跨机房才值得。
+
+### 怎么选
+
+```
+批量小、同机房        逐条 UPDATE
+批量大               按状态 / retry 分组
+跨机房、极致优化      临时表
+```
 
 ## 不用加锁
 

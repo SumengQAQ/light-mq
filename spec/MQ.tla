@@ -130,7 +130,16 @@ MoveEventFromFileToTable ≜
     ∧ ∃ q ∈ QUEUE: file[q] ≠ {}
     ∧ LET   dead_event_group ≜ {event.group: event ∈ {x ∈ table[q]: x.state = Dead}}
             processed_dead ≜ {IF event.group ∈ dead_event_group THEN [event EXCEPT !.state = Dead] ELSE event: event ∈ file[q]}
-      IN    ∧ table' = [q ∈ QUEUE ↦ table[q] ∪ processed_dead]
+      IN    ∧ table' = [x ∈ QUEUE ↦
+                LET dead_event ≜ {e ∈ table[x]: e.state = Dead}
+                    dead_group ≜ {e.group: e ∈ dead_event}
+                    processed ≜ {
+                        IF e.group ∈ dead_group
+                        THEN [e EXCEPT !.state = Dead]
+                        ELSE e
+                        : e ∈ file[x]
+                    }
+                IN table[x] ∪ processed]
             ∧ file' = [q ∈ QUEUE ↦ {}]
             ∧ UNCHANGED ⟨consumer_queue, uid, return_file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
 
@@ -230,20 +239,32 @@ HandleComplete(consumer) ≜
                        ∧ consumer_cache' = [consumer_cache EXCEPT ![consumer] = @ \ {event.u: event ∈ event_group}]
     ∧ UNCHANGED ⟨consumer_queue, uid, file, cache, before, after, frozen, network_buffer⟩
 
-\* 这里是把网络传输的乱序直接省略掉了，所以在实现的时候会有如下的情况
-\* 失败了，把去重表清理了，然后通过网络发回复A准备向文件内写入，但是卡住了
-\* 此时重试的事件到达，失败/成功/死信，然后通过网络发回复B准备向文件内写入，且B先于A到达
-\* 如果B先写入了数据库中，那么A可能会把B的结果覆盖掉
-\* 所以处理返回的事件结果时，更新数据库必须用条件更新
-\* 若文件内该事件为失败，则只能从处理中或失败转移而来，且重试次数需大于原先的重试次数，否则会有更新丢失的问题
-\* 若文件内该事件为死信或成功，则无需任何更新条件
-\* 因为成功和死信为互斥的终态，不可能有在这之后的状态，所以优先级最高
-\* 因为规约中没有建模这部分的乱序，所以条件更新并未在规约中体现
+\* 网络乱序没建模，但实现里会遇到：
+\*   处理失败、清了去重表，发回复 A，网络卡住
+\*   重试的事件到达，再处理一遍，发回复 B，B 先到
+\*   B 先写库，A 后到，把 B 的结果覆盖了
+\*
+\* 条件更新就是挡这个的：
+\*   返回 Success / Dead   终态，无条件写
+\*   返回 Failed           只能从 Processing 或 Failed 来，而且 retry 要更大
+\*
+\* 规约里对应的是 PickOne 和 WriteResultToTable：
+\*   PickOne 在内存里按 uid 挑一条（终态优先，否则 retry 最大）
+\*   落库时同一 uid 只会有一条，再配合 SQL 的 WHERE 条件就是条件更新
+\* 规约里不建模「两条语句的到达顺序」，所以只做到「挑一条」为止。
 
-WriteResultToTable ≜ 
+
+PickOne(S, u) ≜
+    IF ∃ e ∈ S: e.u = u ∧ e.state ∈ {Success, Dead}
+    THEN CHOOSE e ∈ S: e.u = u ∧ e.state ∈ {Success, Dead}
+    ELSE CHOOSE e ∈ S: e.u = u ∧ ¬(∃ f ∈ S: f.u = u ∧ f.retry > e.retry)
+
+WriteResultToTable ≜
     ∧ ∃ q ∈ QUEUE: return_file[q] ≠ {}
-    ∧ table' = [q ∈ QUEUE ↦ (table[q] \ {event ∈ table[q]: event.u ∈ {x.u: x ∈ return_file[q]}}) ∪ return_file[q]]
-    ∧ return_file' = [q ∈ QUEUE ↦ {}]
+    ∧ table' = [x ∈ QUEUE ↦
+          (table[x] \ {e ∈ table[x]: e.u ∈ {y.u: y ∈ return_file[x]}})
+          ∪ {PickOne(return_file[x], u): u ∈ {y.u: y ∈ return_file[x]}}]
+    ∧ return_file' = [x ∈ QUEUE ↦ {}]
     ∧ UNCHANGED ⟨consumer_queue, uid, file, cache, consumer_cache, before, after, frozen, network_buffer, func_buffer⟩
 
 DedupOnlyForLiveOrSuccess ≜
@@ -296,7 +317,9 @@ ConsistentState ≜
     ∀ q ∈ QUEUE: ∀ event ∈ table[q]:
         LET event_group ≜ {x ∈ table[q]: x.group = event.group}
         IN  Cardinality({x.state: x ∈ event_group}) = 1
-
+AtMostOneTerminal ≜
+    ∀ q ∈ QUEUE: ∀ g ∈ 1‥MAX_GROUP:
+        Cardinality({e ∈ table[q]: e.group = g ∧ e.state ∈ {Success, Dead}}) ≤ 1
 Timeout ≜
     \* 直接找数据库中不带end的消息组，然后给整组设置为Dead
     \* 实现是时候就算带了end的消息组也不一定是完整的，照样可能会超时
