@@ -317,9 +317,11 @@ ConsistentState ≜
     ∀ q ∈ QUEUE: ∀ event ∈ table[q]:
         LET event_group ≜ {x ∈ table[q]: x.group = event.group}
         IN  Cardinality({x.state: x ∈ event_group}) = 1
-AtMostOneTerminal ≜
-    ∀ q ∈ QUEUE: ∀ g ∈ 1‥MAX_GROUP:
-        Cardinality({e ∈ table[q]: e.group = g ∧ e.state ∈ {Success, Dead}}) ≤ 1
+
+UidOnlyOnce ≜
+    ∀ q ∈ QUEUE:
+        Cardinality(table[q]) = Cardinality({x.u: x ∈ table[q]})
+
 Timeout ≜
     \* 直接找数据库中不带end的消息组，然后给整组设置为Dead
     \* 实现是时候就算带了end的消息组也不一定是完整的，照样可能会超时
