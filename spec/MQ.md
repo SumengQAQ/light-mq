@@ -125,7 +125,7 @@ func_buffer --HandleComplete--> return_file   处理完，先写返回 WAL
 ∧ in_processing ∉ after[goroutine]
 ```
 
-前两条是「这组能读」，后两条是「这组不在任何人手里」。
+前两条是“这组能读”，后两条是“这组不在任何人手里”。
 
 第三条和第四条分开写，是因为 `before` 和 `after` 里存的东西不一样：
 
@@ -167,13 +167,13 @@ DedupOnlyForLiveOrSuccess ≜
         ∨ (∃ q ∈ QUEUE: ∃ e ∈ return_file[q]: e.u = u ∧ e.state ∈ Terminal)
 ```
 
-意思是「去重表里的每个 uid，要么正在处理，要么已经到终态」。
+意思是“去重表里的每个 uid，要么正在处理，要么已经到终态”。
 
 现在不成立。有个竞态窗口：`return_file` 里已经是 `Success`，但还没落库，数据库里这一行还是 `Failed`。这时候别的协程把它读出来又处理了一遍。
 
-因为消费者有去重，重复处理不会再产生副作用，实际上没事。但不变式按「表里或 WAL 里是终态」写，这个窗口里两边都不是，就被判违反了。
+因为消费者有去重，重复处理不会再产生副作用，实际上没事。但不变式按“表里或 WAL 里是终态”写，这个窗口里两边都不是，就被判违反了。
 
-要写准确，得把「还没落库的终态」也算进去，还要考虑各种交错，不是一条短的不变式能覆盖的。
+要写准确，得把“还没落库的终态”也算进去，还要考虑各种交错，不是一条短的不变式能覆盖的。
 
 ## 分发为什么要拆两步
 
@@ -236,7 +236,7 @@ PickOne(S, u) ≜
     ELSE CHOOSE e ∈ S: e.u = u ∧ ¬(∃ f ∈ S: f.u = u ∧ f.retry > e.retry)
 ```
 
-有终态挑终态，没有就挑 retry 最大的。这一步就是「条件更新」在规约里的对应，落库时每个 uid 只有一行要写。
+有终态挑终态，没有就挑 retry 最大的。这一步就是“条件更新”在规约里的对应，落库时每个 uid 只有一行要写。
 
 ### 逐条写
 
@@ -300,7 +300,7 @@ WHERE d.state IN ('Processing', 'Failed') AND t.retry > d.retry;
 DROP TEMPORARY TABLE tmp;
 ```
 
-`UPDATE ... JOIN` 的意思是：两张表按 `uid` 配对，拿临时表的值去改业务表。不是查询，是「一边对一边改」。
+`UPDATE ... JOIN` 的意思是：两张表按 `uid` 配对，拿临时表的值去改业务表。不是查询，是“一边对一边改”。
 
 `TEMPORARY` 表只在当前连接可见，连接断了自动删。
 
@@ -318,7 +318,7 @@ DROP TEMPORARY TABLE tmp;
 
 `UpdateTableWithProcessing` 把 `after` 里的 `Processing` 写回表。但表里同一 uid 已经有一行了，入队时插的，所以这是更新不是插入。
 
-一开始写成了「只补表里没有的 uid」：
+一开始写成了“只补表里没有的 uid”：
 
 ```tla
 event.u ∉ {x.u: x ∈ table[q]}
@@ -347,15 +347,15 @@ WHERE uid = :uid AND state = 'Pending'
 
 影响 0 行说明已经被别人改过，跳过。
 
-加锁是把冲突挡在门外，状态机是把冲突变成「什么都没发生」。
+加锁是把冲突挡在门外，状态机是把冲突变成“什么都没发生”。
 
-## 冻结（只能证「不分裂」，证不了「不再增长」）
+## 冻结（只能证“不分裂”，证不了“不再增长”）
 
 `Freeze` 记组第一次出现 `end` 时的 uid 集合，已经在 `frozen` 里的不覆盖。
 
 `FrozenStable` 验证的是：`frozen` 里记着的组，不管事件走到 `table`、`before`、`after`、`consumer_queue`、`network_buffer` 还是 `func_buffer`，凑出来的 uid 集合都得和快照一样。
 
-**这条管的是「不分裂」，不是「不再变」。**
+**这条管的是“不分裂”，不是“不再变”。**
 
 规约里 `seq` 是自增的，`end` 之后还能继续往这一组里加事件。真实现要靠 `seq <= end_seq` 挡住，加不进来，组才真正冻结。
 
@@ -366,7 +366,7 @@ WHERE uid = :uid AND state = 'Pending'
 不能证 end 之后这个组不再增长
 ```
 
-第二条要等 `seq` 从参数传进来、并且加上「`end` 之后拒绝更大的 seq」这条守卫，才有意义。现在加了会让状态空间膨胀，先不写。
+第二条要等 `seq` 从参数传进来、并且加上“`end` 之后拒绝更大的 seq”这条守卫，才有意义。现在加了会让状态空间膨胀，先不写。
 
 ## 超时
 
@@ -382,7 +382,7 @@ WHERE uid = :uid AND state = 'Pending'
               (@ \ event_group) ∪ {[e EXCEPT !.state = Dead]: e ∈ event_group}]
 ```
 
-现实里触发条件是「窗口到了还没收集齐」，规约里没有计时，所以直接允许任意时刻触发。
+现实里触发条件是“窗口到了还没收集齐”，规约里没有计时，所以直接允许任意时刻触发。
 
 配套的还有 `SubmitToMiddleware` 开头那条：`table` 里同组已经有 `end` 的话，新消息进不来。没有它，`end` 之后的迟到消息会把已经冻结的组撑大。
 
@@ -432,7 +432,7 @@ AllEventInTerminal ≜
 
 加这个动作等于告诉 TLC：到这一步可以停。
 
-有人会说 `[][Next]_vars` 本来就允许 stutter，为什么还要这个。因为 TLC 的死锁检测看的是「有没有 enabled 的动作」，不看「允不允许 stutter」。所有分支都 disabled 的时候，它照样报 deadlock，除非有个空动作能执行。
+有人会说 `[][Next]_vars` 本来就允许 stutter，为什么还要这个。因为 TLC 的死锁检测看的是“有没有 enabled 的动作”，不看“允不允许 stutter”。所有分支都 disabled 的时候，它照样报 deadlock，除非有个空动作能执行。
 
 ## 对称性
 
@@ -485,7 +485,7 @@ CacheMonotonic ≜
 
 ## 关于指纹碰撞
 
-TLC 用 32 位指纹判断「这两个状态是不是同一个」。状态多了就会撞，撞了会把两个不同的状态当成一个，漏掉它后面的路径。
+TLC 用 32 位指纹判断“这两个状态是不是同一个”。状态多了就会撞，撞了会把两个不同的状态当成一个，漏掉它后面的路径。
 
 TLC 自己估了个概率：
 
