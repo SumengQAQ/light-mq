@@ -157,6 +157,24 @@ after    改成 Processing 之后的
 
 失败清掉是因为要重试。不清的话，重发过来的那组会被当成"处理过了"，直接丢掉，消息就永远丢了。
 
+还有一个不变式本来想写，后来放下了：
+
+```tla
+DedupOnlyForLiveOrSuccess ≜
+    ∀ c ∈ CONSUMER: ∀ u ∈ consumer_cache[c]:
+        ∨ (∃ eg ∈ func_buffer[c]: ∃ e ∈ eg: e.u = u)
+        ∨ (∃ q ∈ QUEUE: ∃ e ∈ table[q]: e.u = u ∧ e.state ∈ Terminal)
+        ∨ (∃ q ∈ QUEUE: ∃ e ∈ return_file[q]: e.u = u ∧ e.state ∈ Terminal)
+```
+
+意思是「去重表里的每个 uid，要么正在处理，要么已经到终态」。
+
+现在不成立。有个竞态窗口：`return_file` 里已经是 `Success`，但还没落库，数据库里这一行还是 `Failed`。这时候别的协程把它读出来又处理了一遍。
+
+因为消费者有去重，重复处理不会再产生副作用，实际上没事。但不变式按「表里或 WAL 里是终态」写，这个窗口里两边都不是，就被判违反了。
+
+要写准确，得把「还没落库的终态」也算进去，还要考虑各种交错，不是一条短的不变式能覆盖的。
+
 ## 分发为什么要拆两步
 
 原来 `DistributeToConsumer` 直接把组塞进 `consumer_queue`，发出即到达。这样测不出"同一组被发两次"这种问题，消费端去重也就没东西可验。
@@ -509,31 +527,7 @@ CacheMonotonic     入队去重表只增不减
 
 活性那条跑起来状态空间还要再翻，先放着。`CacheMonotonic` 同理，它是单调性，和主流程独立。
 
-## 几个还没落地的点
+## 还没做的
 
-**`DedupOnlyForLiveOrSuccess` 现在不成立。**
-
-新的竞态：`return_file` 里已经是 `Success`，但还没落库，数据库里这一行还是 `Failed`。这时候别的协程把它读出来处理了一遍。
-
-因为消费者有去重，重复处理不会再产生副作用，实际上没关系。但不变式是按「表里或 WAL 里是终态」写的，这个时间窗口里两边都不是，就被判违反了。
-
-要写准确，得把「还没落库的终态」也算进去，同时考虑各种交错，不是一条短的不变式能覆盖的。先放着。
-
-**cfg 里的常量是模型值，不是字符串。**
-
-```
-QUEUE = {Q1, Q2}
-GROUPS = {GR1, GR2}
-```
-
-不带引号，`Q1` 是未声明的量，TLC 把它当成模型值。`SYMMETRY` 只能作用在模型值上，换成 `{"Q1", "Q2"}` 这种字符串，置换就不会生效了。
-
-这条不是问题，是必须这么写。留在这里是为了提醒别手贱加引号。
-
-**`Symmetry` 的合法性要确认。**
-
-`Permutations(A) ∪ Permutations(B)` 只有在两个集合不相交的时候才是群。四个并起来如果不满足，TLC 会报错或者静默用错。
-
-## 还没写的
-
-- 活性：`FinalConvergence` 接进 cfg 的 `PROPERTY`
+- 活性：`FinalConvergence` 接进 cfg 的 `PROPERTY`，状态空间会再翻一倍
+- `DedupOnlyForLiveOrSuccess` 那条不变式，等想到怎么表达竞态窗口再说
