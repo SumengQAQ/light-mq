@@ -402,6 +402,20 @@ FinalConvergence ≜ ◇□(∀ q ∈ QUEUE: ∀ e ∈ table[q]: e.state ∈ Ter
 - 每个动作都有 `WF_vars`，不然它可以一直不被调度
 - `Timeout` 能在任意时刻把卡住的组推进 `Dead`
 
+## AllEventInTerminal
+
+```tla
+AllEventInTerminal ≜
+    ∧ ∀ q ∈ QUEUE: ∀ event ∈ table[q]: event.state ∈ Terminal
+    ∧ UNCHANGED vars
+```
+
+所有事件都进终态之后，`Submit`、`Read`、`Dispatch` 这些动作全都不可执行了。TLC 会把这个状态判成死锁，直接报错。
+
+加这个动作等于告诉 TLC：到这一步可以停。
+
+有人会说 `[][Next]_vars` 本来就允许 stutter，为什么还要这个。因为 TLC 的死锁检测看的是「有没有 enabled 的动作」，不看「允不允许 stutter」。所有分支都 disabled 的时候，它照样报 deadlock，除非有个空动作能执行。
+
 ## 对称性
 
 ```tla
@@ -504,16 +518,6 @@ CacheMonotonic     入队去重表只增不减
 因为消费者有去重，重复处理不会再产生副作用，实际上没关系。但不变式是按「表里或 WAL 里是终态」写的，这个时间窗口里两边都不是，就被判违反了。
 
 要写准确，得把「还没落库的终态」也算进去，同时考虑各种交错，不是一条短的不变式能覆盖的。先放着。
-
-**`AllEventInTerminal` 有点多余。**
-
-```tla
-AllEventInTerminal ≜
-    ∧ ∀ q ∈ QUEUE: ∀ event ∈ table[q]: event.state ∈ Terminal
-    ∧ UNCHANGED vars
-```
-
-它只是「所有事件都终态时允许不动」，而 `[][Next]_vars` 本来就允许 stuttering。放在 `Next` 里不影响正确性，但也没什么用。
 
 **cfg 里的常量是模型值，不是字符串。**
 
