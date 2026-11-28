@@ -82,6 +82,16 @@ func_buffer               正在处理
 - 消费端去重（重复到达不会重复处理）
 - 组不分裂（冻结之后，同一组的事件不会分散在两个地方）
 
+2 个队列、2 个消费者、2 个协程、2 个组的配置下跑完：
+
+```
+2,830,371,818 states generated
+  255,412,835 distinct states found
+  depth 86
+```
+
+换了两次指纹种子，结果完全一致，基本可以排除指纹碰撞导致的漏状态。
+
 ```bash
 cd spec
 java -cp ~/tla2tools.jar tlc2.TLC -deadlock -config MQ.cfg MQ.tla

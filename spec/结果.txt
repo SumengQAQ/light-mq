@@ -1,0 +1,19 @@
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = .036
+  based on the actual fingerprints:  val = .003
+2830371818 states generated, 255412835 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 86.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 12 and the 95th percentile is 3).
+Finished in 01h 07min at (2026-11-28 09:59:42)
+
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = .036
+  based on the actual fingerprints:  val = .059
+2830371818 states generated, 255412835 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 86.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 12 and the 95th percentile is 3).
+Finished in 01h 23min at (2026-11-28 12:42:23)
